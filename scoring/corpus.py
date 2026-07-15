@@ -17,9 +17,20 @@ Three sources, all already on disk:
 
 Each entry is tagged with task, strategy_category, payload_variant,
 legitimacy_source, whether the victim agent had defense/basic_defense.py's
-instructional-prevention prompt active, and the bucket
-scoring/tripwires.py's classify_run() actually gave it - plus an OWASP LLM
-Top 10 mapping.
+instructional-prevention prompt active, and the bucket that run's
+classification actually gave it - plus an OWASP LLM Top 10 mapping.
+
+task_origin ("custom" vs "agentdojo") is a DIFFERENT dimension from
+`source` above, despite the similar name - `source` says which pipeline
+stage produced an entry (baseline/attack/replay); task_origin says which
+task universe it came from: our own hand-written tasks (victim/tasks.py,
+scored by scoring/tripwires.py's address-matching classify_run()) or real
+AgentDojo Workspace suite tasks (victim/agentdojo_bridge.py, scored by
+AgentDojo's own injection_task.security() ground truth - see that module
+for why address-matching doesn't generalize to AgentDojo's tasks). Only
+victim/run_task.py's baseline entries can currently be "agentdojo" -
+attacker/run_attack.py and attacker/replay.py aren't AgentDojo-aware yet,
+so every "attack"/"replay"-source entry is task_origin="custom" for now.
 
 OWASP mapping: every task built so far is a prompt-injection variant (an
 attacker controls tool-output content the agent trusts) - LLM01. Extend
@@ -54,7 +65,7 @@ OWASP_CATEGORY_BY_TASK: dict[str, str] = {
 }
 
 CORPUS_FIELDS = [
-    "source", "source_file", "task", "node_id", "trial",
+    "source", "task_origin", "source_file", "task", "node_id", "trial",
     "strategy_category", "payload_variant", "legitimacy_source", "defense",
     "bucket", "owasp_category", "candidate_text",
 ]
@@ -79,9 +90,11 @@ def _entry(
     defense: bool,
     bucket: str | None,
     candidate_text: str,
+    task_origin: str = "custom",
 ) -> dict:
     return {
         "source": source,
+        "task_origin": task_origin,
         "source_file": str(source_file.relative_to(PROJECT_ROOT)),
         "task": task,
         "node_id": node_id,
@@ -122,6 +135,10 @@ def _baseline_log_entries(path: Path) -> list[dict]:
             defense=bool(log.get("defense", False)),
             bucket=log.get("tripwires", {}).get("bucket"),
             candidate_text=candidate_text,
+            # Older logs predate --source (victim/run_task.py) entirely and
+            # were always custom-task runs, so "custom" is the correct
+            # default for them too, not just a placeholder.
+            task_origin=log.get("task_source", "custom"),
         )
     ]
 
@@ -149,6 +166,7 @@ def _attack_log_entries(path: Path) -> list[dict]:
                 defense=False,
                 bucket=node.get("bucket"),
                 candidate_text=node.get("text", ""),
+                task_origin="custom",  # attacker/run_attack.py isn't AgentDojo-aware yet
             )
         )
     return entries
@@ -201,6 +219,7 @@ def _replay_log_entries(path: Path) -> list[dict]:
                 defense=bool(log.get("defense", False)),
                 bucket=trial.get("bucket"),
                 candidate_text=log.get("candidate_text", ""),
+                task_origin="custom",  # attacker/replay.py isn't AgentDojo-aware yet
             )
         )
     return entries
@@ -248,8 +267,9 @@ def print_summary(entries: list[dict]) -> None:
             (e["strategy_category"], e["payload_variant"], e["legitimacy_source"]) for e in task_entries
         }
         defended = sum(1 for e in task_entries if e["defense"])
+        origin = task_entries[0]["task_origin"] if task_entries else "custom"
         print(
-            f"{task}: {len(combos)} distinct strategy/payload/legitimacy combinations tested "
+            f"{task} [{origin}]: {len(combos)} distinct strategy/payload/legitimacy combinations tested "
             f"across {len(task_entries)} real observations ({defended} with defense active)."
         )
 

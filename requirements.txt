@@ -1,3 +1,4 @@
 anthropic==0.116.0
 openai==2.45.0
 python-dotenv==1.2.2
+agentdojo==0.1.35

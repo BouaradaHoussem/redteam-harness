@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 
 import anthropic
 from dotenv import load_dotenv
-from openai import BadRequestError, OpenAI
+from openai import APIError, OpenAI, RateLimitError
 
 from victim.tools import TOOL_DEFINITIONS, ToolBox
 
@@ -115,14 +115,26 @@ class VictimAgent:
         model: str | None = None,
         system_prompt: str = BASE_SYSTEM_PROMPT,
         max_turns: int = 6,
+        tools: list[dict] | None = None,
     ):
         if provider not in ("anthropic", "groq"):
             raise ValueError(f"Unknown provider '{provider}' - expected 'anthropic' or 'groq'.")
 
+        # toolbox is duck-typed, not type-enforced: anything with a
+        # .dispatch(name, input) -> str method works (see victim/tools.py's
+        # ToolBox and victim/agentdojo_bridge.py's AgentDojoToolBox, which
+        # backs the exact same interface with a real AgentDojo environment
+        # instead of our own fake_data/).
         self.toolbox = toolbox
         self.provider = provider
         self.system_prompt = system_prompt
         self.max_turns = max_turns
+        # Anthropic-shaped tool definitions (name/description/input_schema).
+        # Defaults to our own 3 tools; victim/agentdojo_bridge.py passes
+        # AgentDojo's real Workspace tool set instead, converted to this same
+        # shape - the request/response loop below never changes, only which
+        # schemas get sent.
+        self.tools = tools if tools is not None else TOOL_DEFINITIONS
 
         if provider == "anthropic":
             self.model = model or DEFAULT_ANTHROPIC_MODEL
@@ -146,7 +158,7 @@ class VictimAgent:
                 model=self.model,
                 max_tokens=1024,
                 system=self.system_prompt,
-                tools=TOOL_DEFINITIONS,
+                tools=self.tools,
                 messages=messages,
             )
             messages.append({"role": "assistant", "content": response.content})
@@ -180,7 +192,7 @@ class VictimAgent:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_request},
         ]
-        tools = to_openai_tools(TOOL_DEFINITIONS)
+        tools = to_openai_tools(self.tools)
 
         for turn in range(1, self.max_turns + 1):
             try:
@@ -218,16 +230,28 @@ class VictimAgent:
                     result_text = self.toolbox.dispatch(tc.function.name, tool_input)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
 
-            except (BadRequestError, json.JSONDecodeError) as exc:
-                # BadRequestError covers Groq's tool_use_failed (the model produced
-                # a tool call the API itself rejects, e.g. an unknown tool or a
-                # schema mismatch); JSONDecodeError covers the same failure mode
-                # one step later, when the API accepts the call but the arguments
-                # string it hands back isn't valid JSON. Smaller open models miss
-                # tool-call formatting far more often than Claude does, so this is
-                # routine here, not exceptional - report it as a scored trial
-                # (status "invalid_output") instead of crashing the whole batch.
-                return self._invalid_output_result(user_request, messages, turn, exc)
+            except (APIError, json.JSONDecodeError) as exc:
+                # APIError is the base class for every openai SDK error the Groq
+                # call can raise: BadRequestError (Groq's tool_use_failed - the
+                # model produced a tool call the API itself rejects, e.g. an
+                # unknown tool or schema mismatch), RateLimitError (free-tier
+                # daily/per-minute quota hit), APIConnectionError, InternalServerError,
+                # etc. JSONDecodeError covers a failure mode one step further in -
+                # the API accepts the call but the arguments string it hands back
+                # isn't valid JSON. None of these are retried here (a rate limit in
+                # particular should not trigger an automatic retry that just burns
+                # more of the daily quota) - report it as a scored trial (status
+                # "invalid_output") with the real exception message, so
+                # run_task.py's loop can move on to the next trial instead of the
+                # whole batch crashing. RateLimitError gets its own
+                # stop_reason ("rate_limited" instead of "invalid_output"):
+                # it's a provider-side quota error, not anything the model
+                # generated, and callers like run_task.py's trial loop need
+                # to tell the two apart to know when to stop retrying
+                # instead of burning the rest of a quota on guaranteed
+                # failures - see victim/run_task.py's --trials loop.
+                stop_reason = "rate_limited" if isinstance(exc, RateLimitError) else "invalid_output"
+                return self._invalid_output_result(user_request, messages, turn, exc, stop_reason=stop_reason)
 
         return self._max_turns_result(user_request, messages)
 
@@ -245,16 +269,24 @@ class VictimAgent:
         )
 
     def _invalid_output_result(
-        self, user_request: str, messages: list[dict], turn: int, exc: Exception
+        self,
+        user_request: str,
+        messages: list[dict],
+        turn: int,
+        exc: Exception,
+        stop_reason: str = "invalid_output",
     ) -> RunResult:
         """Same RunResult shape as a normal run, just flagged - so callers like
         run_task.py don't need a special case to keep scoring whatever tool
         calls happened before the provider choked, and can move on to the
-        next trial instead of the whole run crashing."""
+        next trial instead of the whole run crashing. stop_reason defaults to
+        "invalid_output" (Groq's tool_use_failed / a JSON parse error) but is
+        "rate_limited" for a caught RateLimitError - see the except clause
+        above for why that distinction matters to callers."""
         return RunResult(
             user_request=user_request,
             final_text=f"(invalid output from provider on turn {turn}: {exc})",
-            stop_reason="invalid_output",
+            stop_reason=stop_reason,
             turns=turn,
             provider=self.provider,
             tool_calls=self.toolbox.log,

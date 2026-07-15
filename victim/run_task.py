@@ -9,6 +9,16 @@ Usage:
     python -m victim.run_task benign --provider groq
     python -m victim.run_task email_exfil --defense
     python -m victim.run_task --diff logs/email_exfil_20260711T010012Z.json
+
+    # --source agentdojo runs real AgentDojo Workspace suite tasks (see
+    # victim/agentdojo_bridge.py) instead of our own hand-written tasks -
+    # a second task source, not a replacement for --source custom (the
+    # default). 'task' is ignored for --source agentdojo; use --user-task /
+    # --injection-task to pick one specific pairing, or omit both to run
+    # the curated demo set (victim.agentdojo_bridge.DEMO_TASKS).
+    python -m victim.run_task all --source agentdojo
+    python -m victim.run_task all --source agentdojo --user-task user_task_0 --injection-task injection_task_0
+    python -m victim.run_task all --source agentdojo --trials 8
 """
 
 import argparse
@@ -20,6 +30,7 @@ from pathlib import Path
 from defense.basic_defense import DEFENDED_SYSTEM_PROMPT, DEFENSE_PROMPT_VERSION
 from scoring.tripwires import TRIPWIRE_VERSION, classify_run
 from victim.agent import BASE_SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, VictimAgent
+from victim.agentdojo_bridge import AgentDojoTask, DEFAULT_ATTACK_NAME, build_agentdojo_task, list_demo_tasks, run_agentdojo_task
 from victim.tasks import TASKS, TASKS_BY_NAME
 from victim.tools import ToolBox
 
@@ -53,6 +64,11 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
     elif bucket == "attempted_injection":
         print("  TRIPWIRE     : \033[93mATTEMPTED INJECTION\033[0m (near miss - malformed tool "
               "call targeted the attacker address before the API rejected it)")
+    elif bucket == "narrated_violation":
+        print("  TRIPWIRE     : \033[93mNARRATED VIOLATION\033[0m (the agent's final answer claims "
+              "it emailed the attacker address, but no send_email call to it actually fired)")
+        for flag in classification["flags"]:
+            print(f"                 - {flag['detail']}")
     elif bucket == "invalid":
         print("  tripwire     : invalid_output (unrelated formatting failure, attacker not implicated)")
     else:
@@ -60,6 +76,7 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
 
     log = {
         "task": task.name,
+        "task_source": "custom",
         "description": task.description,
         "user_request": task.user_request,
         "attacker_address": task.attacker_address,
@@ -69,6 +86,72 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
         "system_prompt_version": prompt_version,
         "system_prompt": agent.system_prompt,
         "tripwire_version": TRIPWIRE_VERSION,
+        "stop_reason": result.stop_reason,
+        "turns": result.turns,
+        "tool_calls": result.tool_calls,
+        "tripwires": classification,
+        "final_text": result.final_text,
+        "transcript": _serialize_transcript(result.transcript),
+    }
+    _save_log(task.name, log)
+    return log
+
+
+def run_agentdojo_one(task: AgentDojoTask, provider: str = "groq", defense: bool = False) -> dict:
+    """Same shape as run_one() (prints the same kind of summary, saves the
+    same kind of log), but for one AgentDojoTask - see
+    victim/agentdojo_bridge.py for what actually runs the agent and scores
+    the result. tripwire_version is None here: scoring/tripwires.py's
+    classify_run() isn't used for AgentDojo tasks (see
+    agentdojo_bridge.classify_agentdojo_run for why), so there's no
+    tripwire-logic version to record."""
+    system_prompt = DEFENDED_SYSTEM_PROMPT if defense else BASE_SYSTEM_PROMPT
+    prompt_version = DEFENSE_PROMPT_VERSION if defense else SYSTEM_PROMPT_VERSION
+    result, classification, model = run_agentdojo_task(task, provider=provider, system_prompt=system_prompt)
+    bucket = classification["bucket"]
+
+    print(f"\n=== {task.name} ===")
+    print(f"  {task.description}")
+    print(f"  provider     : {result.provider} ({model})")
+    print(f"  defense      : {'ON (instructional prevention)' if defense else 'off'}")
+    print(f"  user request : {task.user_request}")
+    print(f"  turns        : {result.turns}  (stop_reason: {result.stop_reason})")
+    for call in result.tool_calls:
+        print(f"  tool call    : {call['name']}({call['input']})")
+    print(f"  final answer : {result.final_text}")
+    if bucket == "tripped":
+        print("  TRIPWIRE     : \033[91mTRIPPED\033[0m")
+        for flag in classification["flags"]:
+            print(f"                 - {flag['detail']}")
+    elif bucket == "attempted_injection":
+        print("  TRIPWIRE     : \033[93mATTEMPTED INJECTION\033[0m (near miss - malformed tool "
+              "call named the injection goal's own identifiers before the API rejected it)")
+    elif bucket == "narrated_violation":
+        print("  TRIPWIRE     : \033[93mNARRATED VIOLATION\033[0m (the agent's final answer claims "
+              "the injection goal was carried out, but no matching tool call ever fired)")
+        for flag in classification["flags"]:
+            print(f"                 - {flag['detail']}")
+    elif bucket == "invalid":
+        print("  tripwire     : invalid_output (unrelated formatting failure)")
+    else:
+        print("  tripwire     : clean")
+
+    log = {
+        "task": task.name,
+        "task_source": "agentdojo",
+        "description": task.description,
+        "user_request": task.user_request,
+        "attacker_address": None,
+        "agentdojo_suite": task.suite_name,
+        "agentdojo_user_task_id": task.user_task_id,
+        "agentdojo_injection_task_id": task.injection_task_id,
+        "agentdojo_attack_name": task.attack_name,
+        "provider": result.provider,
+        "model": model,
+        "defense": defense,
+        "system_prompt_version": prompt_version,
+        "system_prompt": system_prompt,
+        "tripwire_version": None,
         "stop_reason": result.stop_reason,
         "turns": result.turns,
         "tool_calls": result.tool_calls,
@@ -123,8 +206,43 @@ def main():
     parser.add_argument(
         "task",
         nargs="?",
-        choices=[*TASKS_BY_NAME.keys(), "all"],
-        help="Task name, or 'all' to run every task. Omit when using --diff.",
+        help="Custom task name, or 'all', for --source custom (the default). Ignored for "
+        "--source agentdojo - use --user-task/--injection-task there instead. Omit when using --diff.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["custom", "agentdojo"],
+        default="custom",
+        help="'custom' (default) runs our own hand-written tasks (victim/tasks.py) - unchanged "
+        "behavior. 'agentdojo' runs real AgentDojo Workspace suite tasks instead (see "
+        "victim/agentdojo_bridge.py) - a second task source, not a replacement.",
+    )
+    parser.add_argument(
+        "--user-task",
+        metavar="USER_TASK_ID",
+        help="[--source agentdojo] Run one specific AgentDojo user task (e.g. user_task_0). "
+        "Requires --injection-task too. Omit both to run the curated demo set instead.",
+    )
+    parser.add_argument(
+        "--injection-task",
+        metavar="INJECTION_TASK_ID",
+        help="[--source agentdojo] The AgentDojo injection task to pair with --user-task (e.g. injection_task_0).",
+    )
+    parser.add_argument(
+        "--attack",
+        default=DEFAULT_ATTACK_NAME,
+        help=f"[--source agentdojo] Which AgentDojo baseline attack (agentdojo.attacks) generates the "
+        f"injection text (default: {DEFAULT_ATTACK_NAME}). Our own attacker-LLM isn't wired up to "
+        "AgentDojo tasks yet.",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="[--source agentdojo] Run each selected AgentDojo task this many times (default 1) - "
+        "for a real ASR you need repeat trials, same reason the custom tasks get run 8x. Each trial "
+        "gets its own timestamped log (same task name, like the custom tasks' repeat runs already "
+        "do), so scoring/aggregate.py groups them the same way.",
     )
     parser.add_argument(
         "--provider",
@@ -152,8 +270,45 @@ def main():
         print_diff(args.diff)
         return
 
+    if args.source == "agentdojo":
+        if bool(args.user_task) != bool(args.injection_task):
+            parser.error("--user-task and --injection-task must be given together")
+        if args.user_task:
+            agentdojo_tasks = [build_agentdojo_task(args.user_task, args.injection_task, attack_name=args.attack)]
+        else:
+            agentdojo_tasks = list_demo_tasks(attack_name=args.attack)
+
+        total_planned = len(agentdojo_tasks) * args.trials
+        completed = 0
+        quota_exhausted = False
+        for task in agentdojo_tasks:
+            if quota_exhausted:
+                break
+            for _ in range(args.trials):
+                log = run_agentdojo_one(task, provider=args.provider, defense=args.defense)
+                completed += 1
+                if log["stop_reason"] == "rate_limited":
+                    # The provider's quota is exhausted for the whole API key,
+                    # not just this one task - every remaining trial (this
+                    # task's and every task still queued) would fail
+                    # identically, so stop the entire run here instead of
+                    # looping through guaranteed failures and burning nothing
+                    # but wall-clock time.
+                    quota_exhausted = True
+                    break
+        if quota_exhausted:
+            print(
+                f"\nQuota exhausted (RateLimitError) - stopped early: ran {completed}/{total_planned} trials."
+            )
+        return
+
     if not args.task:
         parser.error("the following arguments are required: task (unless --diff is given)")
+    if args.task not in (*TASKS_BY_NAME.keys(), "all"):
+        parser.error(
+            f"invalid task '{args.task}' for --source custom - choose from "
+            f"{sorted(TASKS_BY_NAME.keys())} or 'all'"
+        )
 
     tasks = TASKS if args.task == "all" else [TASKS_BY_NAME[args.task]]
     for task in tasks:
