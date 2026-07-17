@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from defense.basic_defense import DEFENDED_SYSTEM_PROMPT, DEFENSE_PROMPT_VERSION
-from scoring.tripwires import TRIPWIRE_VERSION, classify_run
+from scoring.tripwires import TRIPWIRE_VERSION, classify_run, classify_utility
 from victim.agent import BASE_SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, VictimAgent
 from victim.agentdojo_bridge import AgentDojoTask, DEFAULT_ATTACK_NAME, build_agentdojo_task, list_demo_tasks, run_agentdojo_task
 from victim.tasks import TASKS, TASKS_BY_NAME
@@ -45,6 +45,7 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
     result = agent.run(task.user_request)
     classification = classify_run(task.attacker_address, result.stop_reason, result.final_text, result.tool_calls)
     bucket = classification["bucket"]
+    utility = classify_utility(task.expected_tool, result.tool_calls, result.final_text, result.stop_reason)
 
     print(f"\n=== {task.name} ===")
     print(f"  {task.description}")
@@ -73,6 +74,12 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
         print("  tripwire     : invalid_output (unrelated formatting failure, attacker not implicated)")
     else:
         print("  tripwire     : clean")
+    if utility["false_block"]:
+        print("  UTILITY      : \033[93mFALSE BLOCK\033[0m (expected tool "
+              f"'{task.expected_tool}' not called, or the agent used refusal/suspicion language, "
+              "on a request with no injection to resist)")
+    elif utility["attempted_expected_tool"] is not None:
+        print("  utility      : task completed (expected tool called, no refusal language)")
 
     log = {
         "task": task.name,
@@ -90,6 +97,7 @@ def run_one(task, provider: str = "anthropic", defense: bool = False) -> dict:
         "turns": result.turns,
         "tool_calls": result.tool_calls,
         "tripwires": classification,
+        "utility": utility,
         "final_text": result.final_text,
         "transcript": _serialize_transcript(result.transcript),
     }
@@ -104,11 +112,19 @@ def run_agentdojo_one(task: AgentDojoTask, provider: str = "groq", defense: bool
     the result. tripwire_version is None here: scoring/tripwires.py's
     classify_run() isn't used for AgentDojo tasks (see
     agentdojo_bridge.classify_agentdojo_run for why), so there's no
-    tripwire-logic version to record."""
+    tripwire-logic version to record.
+
+    task.injection_task_id is None for a utility-only task (see
+    build_agentdojo_task()) - there, run_agentdojo_task() returns
+    classification=None (nothing to classify injection-compliance against)
+    and utility=classify_agentdojo_utility_run()'s result instead; for an
+    injection-paired task it's the other way around. Exactly one of
+    (bucket, utility) is meaningful per run - both print/log paths below
+    check for None rather than assuming which kind of task this was."""
     system_prompt = DEFENDED_SYSTEM_PROMPT if defense else BASE_SYSTEM_PROMPT
     prompt_version = DEFENSE_PROMPT_VERSION if defense else SYSTEM_PROMPT_VERSION
-    result, classification, model = run_agentdojo_task(task, provider=provider, system_prompt=system_prompt)
-    bucket = classification["bucket"]
+    result, classification, model, utility = run_agentdojo_task(task, provider=provider, system_prompt=system_prompt)
+    bucket = classification["bucket"] if classification is not None else None
 
     print(f"\n=== {task.name} ===")
     print(f"  {task.description}")
@@ -133,8 +149,17 @@ def run_agentdojo_one(task: AgentDojoTask, provider: str = "groq", defense: bool
             print(f"                 - {flag['detail']}")
     elif bucket == "invalid":
         print("  tripwire     : invalid_output (unrelated formatting failure)")
+    elif bucket is None and utility is not None:
+        print("  tripwire     : n/a (utility-only run, no injection paired - see UTILITY line below)")
     else:
         print("  tripwire     : clean")
+    if utility is not None:
+        if utility["false_block"]:
+            print("  UTILITY      : \033[93mFALSE BLOCK\033[0m (AgentDojo's own utility() ground truth "
+                  "says the task was NOT completed correctly, or the agent used refusal/suspicion "
+                  "language, on a request with no injection to resist)")
+        elif utility["attempted_expected_tool"] is not None:
+            print("  utility      : task completed (AgentDojo's utility() check passed, no refusal language)")
 
     log = {
         "task": task.name,
@@ -155,7 +180,8 @@ def run_agentdojo_one(task: AgentDojoTask, provider: str = "groq", defense: bool
         "stop_reason": result.stop_reason,
         "turns": result.turns,
         "tool_calls": result.tool_calls,
-        "tripwires": classification,
+        "tripwires": classification if classification is not None else {"bucket": None, "flags": []},
+        "utility": utility,
         "final_text": result.final_text,
         "transcript": _serialize_transcript(result.transcript),
     }
@@ -220,13 +246,18 @@ def main():
     parser.add_argument(
         "--user-task",
         metavar="USER_TASK_ID",
-        help="[--source agentdojo] Run one specific AgentDojo user task (e.g. user_task_0). "
-        "Requires --injection-task too. Omit both to run the curated demo set instead.",
+        help="[--source agentdojo] Run one specific AgentDojo user task (e.g. user_task_0). Pair with "
+        "--injection-task for a security (ASR) run, or omit --injection-task for a utility-only run "
+        "(no injection at all - AgentDojo's own run_task_without_injection_tasks() mode, checked "
+        "against BaseUserTask.utility()'s ground truth instead of a tripwire bucket). Omit --user-task "
+        "entirely to run the curated demo set (all injection-paired) instead.",
     )
     parser.add_argument(
         "--injection-task",
         metavar="INJECTION_TASK_ID",
-        help="[--source agentdojo] The AgentDojo injection task to pair with --user-task (e.g. injection_task_0).",
+        help="[--source agentdojo] The AgentDojo injection task to pair with --user-task (e.g. "
+        "injection_task_0). Omit (with --user-task still given) to run --user-task alone with no "
+        "injection - a utility-only run. Requires --user-task; cannot be given by itself.",
     )
     parser.add_argument(
         "--attack",
@@ -271,9 +302,13 @@ def main():
         return
 
     if args.source == "agentdojo":
-        if bool(args.user_task) != bool(args.injection_task):
-            parser.error("--user-task and --injection-task must be given together")
+        if args.injection_task and not args.user_task:
+            parser.error("--injection-task requires --user-task too")
         if args.user_task:
+            # args.injection_task is None here for a utility-only run (no
+            # injection at all) - build_agentdojo_task() treats that as a
+            # first-class mode, not an error, matching AgentDojo's own
+            # run_task_without_injection_tasks().
             agentdojo_tasks = [build_agentdojo_task(args.user_task, args.injection_task, attack_name=args.attack)]
         else:
             agentdojo_tasks = list_demo_tasks(attack_name=args.attack)

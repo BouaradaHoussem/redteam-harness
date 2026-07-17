@@ -13,7 +13,8 @@ Sections:
   3. Step 4 result: the winning candidate replayed with
      defense/basic_defense.py's instructional-prevention prompt active,
      same methodology, real before/after.
-  4. OWASP LLM Top 10 mapping.
+  4. OWASP LLM Top 10 mapping, alongside MITRE ATLAS technique IDs (see
+     scoring/corpus.py's atlas_categories()).
   5. Explicit "not yet done" - most importantly, an adaptive attack against
      the defense hasn't been run. Flagged, not hidden.
 
@@ -27,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scoring.aggregate import summarize
-from scoring.corpus import OWASP_CATEGORY_BY_TASK, build_corpus
+from scoring.corpus import ATLAS_CATEGORY_BY_TASK, OWASP_CATEGORY_BY_TASK, build_corpus
 
 OUTPUT_DIR = Path(__file__).parent.parent / "reports"
 
@@ -42,6 +43,14 @@ ATTACK_TASKS = ["email_exfil", "email_reply_hijack", "calendar_exfil"]
 # from the corpus; only which task/node this section focuses on is fixed.
 FOCUS_TASK = "email_exfil"
 FOCUS_NODE = "n16"
+
+# Display names for the MITRE ATLAS technique IDs scoring/corpus.py assigns -
+# verified against atlas.mitre.org (see corpus.py's module docstring), just
+# for rendering here; corpus.py is the source of truth for the IDs themselves.
+ATLAS_TECHNIQUE_NAMES = {
+    "AML.T0051": "LLM Prompt Injection",
+    "AML.T0053": "LLM Plugin Compromise",
+}
 
 NOT_YET_DONE = [
     "Adaptive attack against the defense: the attacker-LLM (attacker/attacker.py) has not been "
@@ -73,6 +82,20 @@ def _by(entries: list[dict], **filters) -> list[dict]:
 
 def _source_files(entries: list[dict]) -> list[str]:
     return sorted({e["source_file"] for e in entries})
+
+
+def _atlas_categories_observed(entries: list[dict], task: str) -> set[str]:
+    """Every distinct MITRE ATLAS technique ID actually recorded for `task`
+    across the real corpus (scoring/corpus.py's atlas_category field, a
+    ";"-joined string per entry) - picks up AML.T0053 "LLM Plugin
+    Compromise" automatically wherever a real "tripped" observation exists,
+    on top of whatever static primary tag ATLAS_CATEGORY_BY_TASK assigns."""
+    return {
+        category
+        for e in entries
+        if e["task"] == task and e.get("atlas_category")
+        for category in e["atlas_category"].split(";")
+    }
 
 
 def build_report() -> dict:
@@ -128,6 +151,11 @@ def build_report() -> dict:
         "defended_source_files": _source_files(defended_replay),
     }
 
+    atlas_mapping = {}
+    for task in ATTACK_TASKS:
+        primary = ATLAS_CATEGORY_BY_TASK.get(task, "AML.T0051")
+        atlas_mapping[task] = sorted({primary} | _atlas_categories_observed(entries, task))
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_real_observations": len(entries),
@@ -135,6 +163,7 @@ def build_report() -> dict:
         "step2_tap_search": step2,
         "step4_defense": step4,
         "owasp_mapping": {task: OWASP_CATEGORY_BY_TASK.get(task, "LLM01") for task in ATTACK_TASKS},
+        "atlas_mapping": atlas_mapping,
         "not_yet_done": NOT_YET_DONE,
     }
 
@@ -224,11 +253,21 @@ def render_markdown(report: dict) -> str:
         f"**Result: the instructional-prevention defense took `{step4['node_id']}`'s real ASR from "
         f"{_pct(u, 'strict_asr')} to {_pct(d, 'strict_asr')} ({d['tripped']}/{d['total']}).**",
         "",
-        "## 4. OWASP LLM Top 10 Mapping",
+        "## 4. Threat Framework Mapping (OWASP LLM Top 10 + MITRE ATLAS)",
         "",
+        "_ATLAS technique IDs verified against MITRE's own published ATLAS data "
+        "(atlas.mitre.org) before being hardcoded in scoring/corpus.py - not guessed. "
+        "AML.T0053 only appears for a task where at least one real observation actually "
+        "reached bucket=\"tripped\" (the injected tool call fired, not just attempted or "
+        "narrated) - see scoring/corpus.py's atlas_categories()._",
+        "",
+        "| Task | OWASP | MITRE ATLAS |",
+        "|---|---|---|",
     ]
-    for task, category in report["owasp_mapping"].items():
-        lines.append(f"- `{task}`: **{category}** - Prompt Injection")
+    for task, owasp_cat in report["owasp_mapping"].items():
+        atlas_cats = report["atlas_mapping"].get(task, [])
+        atlas_str = ", ".join(f"{c} ({ATLAS_TECHNIQUE_NAMES.get(c, c)})" for c in atlas_cats)
+        lines.append(f"| `{task}` | {owasp_cat} - Prompt Injection | {atlas_str} |")
     lines += [
         "",
         "## 5. Not Yet Done",
