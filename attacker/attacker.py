@@ -226,6 +226,7 @@ class TAPRunResult:
     nodes: list[AttackNode]  # every node ever created this run, tested or pruned
     victim_calls: int
     attacker_calls: int
+    defense: bool = False  # True if every test_candidate() call this run used a non-default system_prompt
 
 
 def build_dynamic_toolbox(task: Task, target: InjectionTarget, candidate_text: str) -> ToolBox:
@@ -460,11 +461,11 @@ def test_candidate(
     """Run one candidate against a real VictimAgent and classify the result.
     system_prompt defaults to None, meaning VictimAgent's own undefended
     BASE_SYSTEM_PROMPT - pass defense/basic_defense.py's
-    DEFENDED_SYSTEM_PROMPT (see attacker/replay.py's --defense flag) to test
-    the same candidate against a hardened prompt instead. run_tap() never
-    passes this, so the search itself always runs undefended - only replay
-    (a fixed candidate, not a search) currently supports testing with the
-    defense on."""
+    DEFENDED_SYSTEM_PROMPT to test the same candidate against a hardened
+    prompt instead. attacker/replay.py's --defense flag uses this directly
+    for a fixed candidate; run_tap()'s own system_prompt param (see above)
+    threads it through here for a full adaptive search instead - see
+    attacker/adaptive_attacker.py."""
     toolbox = build_dynamic_toolbox(task, target, candidate_text)
     agent_kwargs = {"toolbox": toolbox, "provider": provider, "model": victim_model}
     if system_prompt is not None:
@@ -485,7 +486,15 @@ def run_tap(
     branch_factor: int = 3,
     depth: int = 3,
     hint: str | None = None,
+    system_prompt: str | None = None,
 ) -> TAPRunResult:
+    """system_prompt defaults to None, meaning every test_candidate() call
+    this run uses VictimAgent's own undefended BASE_SYSTEM_PROMPT - the
+    original, still-default behavior for attacker/run_attack.py's plain
+    search. Pass defense/basic_defense.py's DEFENDED_SYSTEM_PROMPT (see
+    attacker/adaptive_attacker.py) to run the exact same TAP loop/pruning
+    against the DEFENDED victim agent instead - the only difference is which
+    system prompt every test_candidate() call in this run uses."""
     if task_name not in TASKS_BY_NAME:
         raise ValueError(f"Unknown task '{task_name}'.")
     task = TASKS_BY_NAME[task_name]
@@ -555,7 +564,9 @@ def run_tap(
 
         new_frontier: list[str] = []
         for parent_text, c in surviving:
-            result, classification = test_candidate(task, target, c.text, victim_provider, victim_model)
+            result, classification = test_candidate(
+                task, target, c.text, victim_provider, victim_model, system_prompt=system_prompt
+            )
             victim_calls += 1
             node = AttackNode(
                 node_id=f"n{next(node_counter)}",
@@ -599,4 +610,5 @@ def run_tap(
         nodes=all_nodes,
         victim_calls=victim_calls,
         attacker_calls=attacker_calls,
+        defense=system_prompt is not None,
     )
